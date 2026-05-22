@@ -7,11 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "prisma:generate": "echo \"prisma removed\"",
-    "prisma:migrate": "echo \"prisma removed\"",
-    "prisma:push": "echo \"prisma removed\"",
-    "prisma:seed": "echo \"prisma removed\"",
-    "prisma:studio": "echo \"prisma removed\""
+    "seed": "node scripts/seed.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
@@ -40,6 +36,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "dotenv": "^17.4.2",
     "dotenv-cli": "^9.0.0",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",

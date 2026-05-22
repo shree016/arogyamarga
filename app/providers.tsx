@@ -9,12 +9,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const stored = localStorage.getItem("am-theme");
-    const preferred = stored
-      ? (stored as "light" | "dark")
-      : window.matchMedia("(prefers-color-scheme: dark)").matches
-        ? "dark"
-        : "light";
-    setTheme(preferred);
+    setTheme((stored as "light" | "dark") ?? "light");
   }, [setTheme]);
 
   useEffect(() => {

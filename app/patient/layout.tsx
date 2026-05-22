@@ -5,5 +5,9 @@ export default function PatientLayout({
 }: {
   children: React.ReactNode;
 }) {
-  return <RoleGuard allow={["Patient", "Super Admin"]}>{children}</RoleGuard>;
+  return (
+    <RoleGuard allow={["Patient", "Super Admin"]}>
+      {children}
+    </RoleGuard>
+  );
 }

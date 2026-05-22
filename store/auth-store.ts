@@ -1,58 +1,55 @@
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
 import type { UserRole } from "@/lib/permissions";
 
 type AuthState = {
   isAuthenticated: boolean;
+  userId: string | null;
   role: UserRole | null;
   name: string | null;
-  age: string | null;
-  gender: string | null;
+  email: string | null;
+  patientType: string | null;
+  patientId: string | null; // PT-XXXX identifier for patients
   hasHydrated: boolean;
-  login: (payload: {
+  setUser: (payload: {
+    userId: string;
     role: UserRole;
     name: string;
-    age?: string | null;
-    gender?: string | null;
+    email: string;
+    patientType?: string | null;
+    patientId?: string | null;
   }) => void;
-  logout: () => void;
-  setRole: (role: UserRole) => void;
+  clearUser: () => void;
   setHydrated: (value: boolean) => void;
 };
 
-export const useAuthStore = create<AuthState>()(
-  persist(
-    (set) => ({
+export const useAuthStore = create<AuthState>()((set) => ({
+  isAuthenticated: false,
+  userId: null,
+  role: null,
+  name: null,
+  email: null,
+  patientType: null,
+  patientId: null,
+  hasHydrated: false,
+  setUser: ({ userId, role, name, email, patientType, patientId }) =>
+    set({
+      isAuthenticated: true,
+      userId,
+      role,
+      name,
+      email,
+      patientType: patientType ?? null,
+      patientId: patientId ?? null,
+    }),
+  clearUser: () =>
+    set({
       isAuthenticated: false,
+      userId: null,
       role: null,
       name: null,
-      age: null,
-      gender: null,
-      hasHydrated: false,
-      login: ({ role, name, age, gender }) =>
-        set({
-          isAuthenticated: true,
-          role,
-          name,
-          age: age ?? null,
-          gender: gender ?? null,
-        }),
-      logout: () =>
-        set({
-          isAuthenticated: false,
-          role: null,
-          name: null,
-          age: null,
-          gender: null,
-        }),
-      setRole: (role) => set({ role }),
-      setHydrated: (value) => set({ hasHydrated: value }),
+      email: null,
+      patientType: null,
+      patientId: null,
     }),
-    {
-      name: "am-auth",
-      onRehydrateStorage: () => (state) => {
-        state?.setHydrated(true);
-      },
-    },
-  ),
-);
+  setHydrated: (value) => set({ hasHydrated: value }),
+}));

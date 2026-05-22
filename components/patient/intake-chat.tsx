@@ -3,27 +3,28 @@
 import {
   useActionState,
   useEffect,
-  useMemo,
+  useRef,
   useState,
   startTransition,
 } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { AnimatePresence, motion } from "framer-motion";
-import { Mic, Send } from "lucide-react";
+import { CheckCircle, Loader2, Send } from "lucide-react";
 import { submitIntake } from "@/app/actions/ai";
-import type { ChatMessage, IntakeActionState } from "@/lib/types";
+import type { IntakeActionState } from "@/lib/types";
 import { intakeSchema } from "@/lib/validation";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Badge } from "@/components/ui/badge";
 import { useIntakeStore } from "@/store/intake-store";
-import { useQueueStore } from "@/store/queue-store";
+import { createClient } from "@/lib/client";
 import { useAuthStore } from "@/store/auth-store";
 import { createQueueToken } from "@/lib/queue";
 import { cn } from "@/lib/utils";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
 
-const suggestions = [
+const SUGGESTIONS = [
   "Fever since morning",
   "Knee pain",
   "Chest tightness",
@@ -33,335 +34,317 @@ const suggestions = [
 
 const initialState: IntakeActionState = { status: "idle" };
 
-export function IntakeChat() {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: "intro",
-      role: "ai",
-      content:
-        "Hi, I am Arogya AI. Tell me how you feel today, and I will guide you.",
-      timestamp: new Date().toISOString(),
-    },
-  ]);
+type DecisionResponse = {
+  recommendation?: string;
+  department?: string;
+  doctorName?: string;
+  doctorId?: string | null;
+  urgency?: string;
+  triageScore?: number;
+  estimatedWaitMinutes?: number;
+  error?: string;
+};
+
+export function IntakeChat({
+  patientAge = "",
+  patientGender = "",
+}: {
+  patientAge?: string;
+  patientGender?: string;
+}) {
+  const router = useRouter();
+  const { name: authName, userId } = useAuthStore();
+  const patientName = authName ?? "";
+
+  const {
+    messages,
+    initialSymptoms,
+    followQueue,
+    currentFollowIndex,
+    followAnswers,
+    chatPhase,
+    token,
+    doctor,
+    department,
+    addMessage,
+    setInitialSymptoms,
+    setFollowState,
+    advanceFollow,
+    setChatPhase,
+    setStructured,
+    setTriage,
+    setEmergency,
+    setRouting,
+    setToken,
+    reset,
+  } = useIntakeStore();
 
   const [state, action, isPending] = useActionState(submitIntake, initialState);
-  const [followQueue, setFollowQueue] = useState<string[]>([]);
-  const [currentFollowIndex, setCurrentFollowIndex] = useState(0);
-  const [followAnswers, setFollowAnswers] = useState<Record<string, string>>(
-    {},
-  );
   const [followInput, setFollowInput] = useState("");
-  const [initialSymptoms, setInitialSymptoms] = useState("");
-  const [finalDecision, setFinalDecision] = useState("");
-  const { setStructured, setTriage, setEmergency, setRouting, setToken } =
-    useIntakeStore();
-  const {
-    name: patientName,
-    age: patientAge,
-    gender: patientGender,
-  } = useAuthStore();
-  const { addPatient, prioritizeEmergency } = useQueueStore();
+  const [isDeciding, setIsDeciding] = useState(false);
 
-  const {
-    register,
-    handleSubmit,
-    reset,
-    formState: { errors },
-  } = useForm<{ symptoms: string }>({
-    resolver: zodResolver(intakeSchema),
-  });
+  // Ref so the useEffect always sees the latest initialSymptoms without
+  // being re-registered every time the store updates
+  const initialSymptomsRef = useRef(initialSymptoms);
+  useEffect(() => { initialSymptomsRef.current = initialSymptoms; }, [initialSymptoms]);
 
+  const { register, handleSubmit, reset: resetForm, formState: { errors } } =
+    useForm<{ symptoms: string }>({ resolver: zodResolver(intakeSchema) });
+
+  // Process server-action result
   useEffect(() => {
-    // Append AI message and follow-ups whenever the action succeeds
-    if (state.status !== "success" || !state.aiMessage) {
-      return;
-    }
+    if (state.status !== "success" || !state.aiMessage) return;
+    if (chatPhase === "complete") return;
 
-    setMessages((prev) => {
-      // avoid duplicating identical AI messages
-      const last = prev[prev.length - 1];
-      if (last?.role === "ai" && last?.content === state.aiMessage) return prev;
-      return [
-        ...prev,
-        {
-          id: `ai-${Date.now()}`,
-          role: "ai",
-          content: state.aiMessage,
-          timestamp: new Date().toISOString(),
-        },
-      ];
+    addMessage({
+      id: `ai-${Date.now()}`,
+      role: "ai",
+      content: state.aiMessage,
+      timestamp: new Date().toISOString(),
     });
 
-    if (state.followUps?.length) {
-      setFinalDecision("");
-      setFollowQueue(state.followUps);
-      setCurrentFollowIndex(0);
-      setFollowAnswers({});
-      setFollowInput("");
+    if (state.structured) setStructured(state.structured);
+    if (state.triage) setTriage(state.triage);
+    setEmergency(Boolean(state.emergency));
 
-      const firstQuestion = state.followUps[0];
-      if (firstQuestion) {
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "ai" && last?.content === firstQuestion) {
-            return prev;
-          }
-
-          return [
-            ...prev,
-            {
-              id: `follow-${Date.now()}`,
-              role: "ai",
-              content: firstQuestion,
-              timestamp: new Date().toISOString(),
-            },
-          ];
+    if (state.emergency) {
+      // Skip follow-ups for emergencies — decide immediately
+      void callDecision(initialSymptomsRef.current, {}, true);
+    } else if (state.followUps?.length) {
+      setFollowState(state.followUps, 0, {});
+      const first = state.followUps[0];
+      if (first) {
+        addMessage({
+          id: `follow-0-${Date.now()}`,
+          role: "ai",
+          content: first,
+          timestamp: new Date().toISOString(),
         });
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
 
-    if (state.structured) {
-      setStructured(state.structured);
-    }
-
-    if (state.triage) {
-      setTriage(state.triage);
-      setRouting(state.triage.department, state.triage.recommendedDoctor);
-    }
-
-    const emergency = Boolean(state.emergency);
-    setEmergency(emergency);
-
-    const token = createQueueToken(emergency);
-    setToken(token);
-    const patientEntry = {
-      id: `queue-${token}`,
-      name: "You",
-      token,
-      department: emergency ? "Emergency" : state.triage.department,
-      status: emergency ? "Your Turn" : "Registered",
-      waitMinutes: emergency ? 0 : state.triage.waitMinutes,
-      emergency,
-    };
-
-    if (emergency) {
-      prioritizeEmergency(patientEntry);
-    } else {
-      addPatient(patientEntry);
-    }
-  }, [
-    addPatient,
-    prioritizeEmergency,
-    setEmergency,
-    setRouting,
-    setStructured,
-    setTriage,
-    setToken,
-    state,
-  ]);
-
+  // ── Submit initial symptoms ────────────────────────────────────────────────
   const onSubmit = handleSubmit((values) => {
-    const formData = new FormData();
-    formData.set("symptoms", values.symptoms);
-    formData.set("patientName", patientName ?? "");
-    formData.set("patientAge", patientAge ?? "");
-    formData.set("patientGender", patientGender ?? "");
     setInitialSymptoms(values.symptoms);
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `user-${Date.now()}`,
-        role: "user",
-        content: values.symptoms,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-
-    startTransition(() => {
-      action(formData);
+    addMessage({
+      id: `user-${Date.now()}`,
+      role: "user",
+      content: values.symptoms,
+      timestamp: new Date().toISOString(),
     });
-    reset();
+    const fd = new FormData();
+    fd.set("symptoms", values.symptoms);
+    fd.set("patientName", patientName);
+    fd.set("patientAge", patientAge);
+    fd.set("patientGender", patientGender);
+    startTransition(() => action(fd));
+    resetForm();
   });
 
   const sendSuggestion = (suggestion: string) => {
-    const formData = new FormData();
-    formData.set("symptoms", suggestion);
-    formData.set("patientName", patientName ?? "");
-    formData.set("patientAge", patientAge ?? "");
-    formData.set("patientGender", patientGender ?? "");
     setInitialSymptoms(suggestion);
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `user-${Date.now()}`,
-        role: "user",
-        content: suggestion,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-
-    startTransition(() => {
-      action(formData);
+    addMessage({
+      id: `user-${Date.now()}`,
+      role: "user",
+      content: suggestion,
+      timestamp: new Date().toISOString(),
     });
+    const fd = new FormData();
+    fd.set("symptoms", suggestion);
+    fd.set("patientName", patientName);
+    fd.set("patientAge", patientAge);
+    fd.set("patientGender", patientGender);
+    startTransition(() => action(fd));
   };
 
-  // Helpers for follow-up Q&A flow
-  const currentQuestion = followQueue[currentFollowIndex];
-  const followProgress =
-    currentQuestion && followQueue.length > 0
-      ? ((currentFollowIndex + 1) / followQueue.length) * 100
-      : 0;
-
-  function detectOptions(question: string | undefined) {
-    if (!question) return null;
-    // simple parse: look for parentheses with comma or slash separated options
-    const m = question.match(/\(([^)]+)\)/);
-    if (m) {
-      const inside = m[1];
-      if (
-        inside.includes("/") ||
-        inside.includes(",") ||
-        inside.includes(" or ")
-      ) {
-        return inside
-          .split(/[,/]| or /i)
-          .map((s) => s.trim())
-          .filter(Boolean);
-      }
-    }
-    // also try inline 'yes/no'
-    if (/yes\/?no|yes or no/i.test(question)) return ["Yes", "No"];
-    return null;
-  }
-
-  async function submitFollowAnswer(answer: string) {
-    if (!currentQuestion) return;
-    // record user answer as a message
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `user-follow-${Date.now()}`,
-        role: "user",
-        content: answer,
-        timestamp: new Date().toISOString(),
-      },
-    ]);
-
-    setFollowAnswers((prev) => ({ ...prev, [currentQuestion]: answer }));
-
-    const updatedAnswers = { ...followAnswers, [currentQuestion]: answer };
-    const next = currentFollowIndex + 1;
-
-    if (next < followQueue.length) {
-      const nextQuestion = followQueue[next];
-      setFollowAnswers(updatedAnswers);
-      setCurrentFollowIndex(next);
-      setFollowInput("");
-
-      if (nextQuestion) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `follow-${Date.now()}`,
-            role: "ai",
-            content: nextQuestion,
-            timestamp: new Date().toISOString(),
-          },
-        ]);
-      }
-      return;
-    }
-
-    // all answers collected — compile final prompt and fetch decision
-    const payload = {
-      symptoms: initialSymptoms,
-      answers: updatedAnswers,
-      patientName,
-      patientAge,
-      patientGender,
-    };
-
+  // ── Call decision API then create queue entry ──────────────────────────────
+  async function callDecision(
+    symptoms: string,
+    answers: Record<string, string>,
+    emergency: boolean,
+  ) {
+    setIsDeciding(true);
     try {
       const res = await fetch("/api/ai/decision", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ symptoms, answers, patientName, patientAge, patientGender }),
       });
-      const data = await res.json();
-      if (data?.decision) {
-        setFinalDecision(data.decision);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-decision-${Date.now()}`,
-            role: "ai",
-            content: data.decision,
-            timestamp: new Date().toISOString(),
-          },
-        ]);
-      }
-    } catch {
-      setFinalDecision("Unable to fetch decision at the moment.");
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `ai-decision-error-${Date.now()}`,
+
+      let data: DecisionResponse = {};
+      try { data = (await res.json()) as DecisionResponse; } catch { /* ignore */ }
+
+      const dept = emergency ? "Emergency" : (data.department ?? "General Medicine");
+      const docName = emergency ? "ER Team" : (data.doctorName ?? "");
+      const urgency = emergency ? "Emergency" : (data.urgency ?? "Moderate");
+      const score = emergency ? 5 : (data.triageScore ?? 3);
+      const wait = emergency ? 0 : (data.estimatedWaitMinutes ?? 25);
+      const recommendation = data.recommendation ?? "";
+
+      setRouting(dept, docName, data.doctorId ?? undefined);
+      const tok = createQueueToken(emergency);
+      setToken(tok);
+
+      if (recommendation) {
+        addMessage({
+          id: `ai-rec-${Date.now()}`,
           role: "ai",
-          content: "Unable to fetch decision at the moment.",
+          content: recommendation,
           timestamp: new Date().toISOString(),
-        },
-      ]);
+        });
+      }
+
+      if (userId) {
+        const supabase = createClient();
+        const { error } = await supabase.from("queue_entries").insert({
+          patient_id: userId,
+          token: tok,
+          department: dept,
+          doctor_id: (!emergency && data.doctorId) ? data.doctorId : null,
+          status: emergency ? "Your Turn" : "Registered",
+          patient_type: "OPD",
+          is_emergency: emergency,
+          symptoms,
+          triage_score: score,
+          triage_urgency: urgency,
+          wait_minutes: wait,
+          notes: recommendation,
+        });
+
+        if (!error) {
+          setChatPhase("complete");
+          setTimeout(() => router.push("/patient/queue"), 2500);
+        }
+      }
     } finally {
-      // clear follow flow
-      setFollowQueue([]);
-      setCurrentFollowIndex(0);
-      setFollowAnswers({});
-      setFollowInput("");
+      setIsDeciding(false);
     }
   }
 
-  const emergencyBanner = useMemo(() => state.emergency, [state.emergency]);
+  // ── Handle follow-up answer ────────────────────────────────────────────────
+  async function handleFollowAnswer(answer: string) {
+    const currentQuestion = followQueue[currentFollowIndex];
+    if (!currentQuestion) return;
 
+    // Capture before store mutation
+    const updatedAnswers = { ...followAnswers, [currentQuestion]: answer };
+    const next = currentFollowIndex + 1;
+
+    addMessage({
+      id: `user-${Date.now()}`,
+      role: "user",
+      content: answer,
+      timestamp: new Date().toISOString(),
+    });
+    advanceFollow(currentQuestion, answer);
+    setFollowInput("");
+
+    if (next < followQueue.length) {
+      const nextQ = followQueue[next];
+      if (nextQ) {
+        addMessage({
+          id: `follow-${next}-${Date.now()}`,
+          role: "ai",
+          content: nextQ,
+          timestamp: new Date().toISOString(),
+        });
+      }
+      return;
+    }
+
+    // All answered → get decision
+    await callDecision(initialSymptomsRef.current, updatedAnswers, false);
+  }
+
+  // ── Derived ────────────────────────────────────────────────────────────────
+  const currentQuestion = followQueue[currentFollowIndex] as string | undefined;
+  const followProgress =
+    followQueue.length > 0 ? (currentFollowIndex / followQueue.length) * 100 : 0;
+
+  function detectOptions(q: string | undefined) {
+    if (!q) return null;
+    const m = q.match(/\(([^)]+)\)/);
+    if (m) {
+      const inside = m[1];
+      if (inside.includes("/") || inside.includes(",") || inside.includes(" or ")) {
+        return inside.split(/[,/]| or /i).map((s) => s.trim()).filter(Boolean);
+      }
+    }
+    if (/yes\/?no|yes or no/i.test(q)) return ["Yes", "No"];
+    return null;
+  }
+
+  // ── "Already in queue" screen ──────────────────────────────────────────────
+  if (chatPhase === "complete") {
+    return (
+      <div className="flex flex-col items-center gap-6 py-10 text-center">
+        <div className="flex h-16 w-16 items-center justify-center rounded-full bg-success/15">
+          <CheckCircle size={30} className="text-success" />
+        </div>
+        <div className="space-y-1">
+          <h2 className="text-xl font-semibold">You&apos;re in the queue!</h2>
+          {doctor && department && (
+            <p className="text-sm text-muted-foreground">
+              {doctor} &middot; {department}
+            </p>
+          )}
+          {token && (
+            <p className="mt-2 font-mono text-3xl font-bold tracking-widest text-accent">
+              {token}
+            </p>
+          )}
+        </div>
+        <div className="flex gap-3">
+          <Button asChild size="lg">
+            <Link href="/patient/queue">View Queue Status</Link>
+          </Button>
+          <Button variant="outline" size="lg" onClick={reset}>
+            Start New Visit
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Main chat UI ───────────────────────────────────────────────────────────
   return (
     <div className="space-y-6">
       <AnimatePresence>
-        {emergencyBanner && (
+        {state.emergency && (
           <motion.div
             initial={{ opacity: 0, y: -10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
             className="rounded-3xl border border-danger/40 bg-danger/15 px-5 py-4 text-sm font-semibold text-danger"
           >
-            Emergency detected. You are being escalated to priority care.
+            Emergency detected — escalating you to priority care.
           </motion.div>
         )}
       </AnimatePresence>
 
+      {/* Messages */}
       <div className="space-y-4">
-        {messages.map((message) => (
+        {messages.map((msg) => (
           <div
-            key={message.id}
-            className={cn(
-              "flex",
-              message.role === "user" ? "justify-end" : "justify-start",
-            )}
+            key={msg.id}
+            className={cn("flex", msg.role === "user" ? "justify-end" : "justify-start")}
           >
             <div
               className={cn(
                 "max-w-[80%] rounded-3xl px-4 py-3 text-sm shadow-sm",
-                message.role === "user"
+                msg.role === "user"
                   ? "bg-primary text-primary-foreground"
                   : "bg-card text-foreground",
               )}
             >
-              {message.content}
+              {msg.content}
             </div>
           </div>
         ))}
 
-        {isPending && (
+        {(isPending || isDeciding) && (
           <div className="flex justify-start">
             <div className="rounded-3xl bg-card px-4 py-3">
               <TypingIndicator />
@@ -370,196 +353,103 @@ export function IntakeChat() {
         )}
       </div>
 
-      <div className="flex flex-wrap gap-2">
-        {suggestions.map((suggestion) => (
-          <button
-            key={suggestion}
-            type="button"
-            onClick={() => sendSuggestion(suggestion)}
-            className="rounded-full border border-border bg-card px-3 py-1 text-xs font-semibold text-muted-foreground transition hover:text-foreground"
-          >
-            {suggestion}
-          </button>
-        ))}
-      </div>
+      {/* Suggestion chips — only before first submission */}
+      {messages.length <= 1 && !isPending && (
+        <div className="flex flex-wrap gap-2">
+          {SUGGESTIONS.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => sendSuggestion(s)}
+              className="rounded-full border border-border bg-card px-3 py-1.5 text-xs font-semibold text-muted-foreground transition hover:text-foreground"
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
 
-      {currentQuestion && (
+      {/* Follow-up Q&A */}
+      {currentQuestion && !isDeciding && (
         <div className="rounded-3xl border border-border bg-card p-4">
-          <p className="text-xs font-semibold text-muted-foreground">
-            AI follow-up
-          </p>
-          <div className="mt-3 space-y-2">
-            <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-              <span>
-                Question {currentFollowIndex + 1} of {followQueue.length}
-              </span>
-              <span>{Math.round(followProgress)}%</span>
-            </div>
-            <div className="h-2 overflow-hidden rounded-full bg-muted/60">
-              <motion.div
-                className="h-full rounded-full bg-primary"
-                initial={false}
-                animate={{ width: `${followProgress}%` }}
-                transition={{ duration: 0.25, ease: "easeOut" }}
-              />
-            </div>
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-xs font-semibold text-muted-foreground">Follow-up</p>
+            <span className="text-xs text-muted-foreground">
+              {currentFollowIndex + 1} / {followQueue.length}
+            </span>
           </div>
-          <div className="mt-2 flex justify-start">
-            <div className="max-w-[80%] rounded-3xl bg-card px-4 py-3 text-sm shadow-sm">
-              {currentQuestion}
-            </div>
+          <div className="mb-4 h-1.5 overflow-hidden rounded-full bg-muted/60">
+            <motion.div
+              className="h-full rounded-full bg-primary"
+              initial={false}
+              animate={{ width: `${followProgress}%` }}
+              transition={{ duration: 0.25 }}
+            />
           </div>
 
-          <div className="mt-3">
-            {(() => {
-              const opts = detectOptions(currentQuestion);
-              if (opts && opts.length) {
-                return (
-                  <div className="flex flex-wrap gap-2">
-                    {opts.map((opt) => (
-                      <Button
-                        key={opt}
-                        type="button"
-                        onClick={() => submitFollowAnswer(opt)}
-                        size="sm"
-                        variant="outline"
-                      >
-                        {opt}
-                      </Button>
-                    ))}
-                  </div>
-                );
-              }
-
+          {(() => {
+            const opts = detectOptions(currentQuestion);
+            if (opts?.length) {
               return (
-                <div className="flex gap-2">
-                  <input
-                    value={followInput}
-                    onChange={(e) => setFollowInput(e.target.value)}
-                    className="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm outline-none"
-                    placeholder="Type your answer..."
-                  />
-                  <Button
-                    type="button"
-                    onClick={() => submitFollowAnswer(followInput || "-")}
-                  >
-                    Next
-                  </Button>
+                <div className="flex flex-wrap gap-2">
+                  {opts.map((opt) => (
+                    <Button
+                      key={opt}
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleFollowAnswer(opt)}
+                    >
+                      {opt}
+                    </Button>
+                  ))}
                 </div>
               );
-            })()}
-          </div>
+            }
+            return (
+              <div className="flex gap-2">
+                <input
+                  value={followInput}
+                  onChange={(e) => setFollowInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void handleFollowAnswer(followInput || "-");
+                  }}
+                  className="flex-1 rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-primary"
+                  placeholder="Type your answer…"
+                />
+                <Button type="button" onClick={() => void handleFollowAnswer(followInput || "-")}>
+                  Next
+                </Button>
+              </div>
+            );
+          })()}
         </div>
       )}
 
-      {finalDecision && !currentQuestion && (
-        <div className="rounded-3xl border border-primary/20 bg-linear-to-br from-primary/10 via-card to-card p-5 shadow-sm">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                Final recommendation
-              </p>
-              <h3 className="mt-1 text-lg font-semibold text-foreground">
-                Doctor guidance summary
-              </h3>
-            </div>
-            <Badge variant="outline">LLM Result</Badge>
-          </div>
-
-          <div className="mt-4 rounded-2xl border border-border/70 bg-background/80 p-4">
-            {finalDecision
-              .split("\n")
-              .map((line) => line.trim())
-              .filter(Boolean)
-              .map((line, index) =>
-                index === 0 ? (
-                  <p
-                    key={line}
-                    className="text-base font-semibold text-foreground"
-                  >
-                    {line}
-                  </p>
-                ) : (
-                  <p
-                    key={line}
-                    className="mt-2 text-sm leading-6 text-muted-foreground"
-                  >
-                    {line}
-                  </p>
-                ),
-              )}
-          </div>
-        </div>
-      )}
-
-      <div className="relative">
-        <form onSubmit={onSubmit} className="sticky bottom-4">
+      {/* Symptom input — hidden while follow-up is active or deciding */}
+      {!currentQuestion && !isDeciding && (
+        <form onSubmit={onSubmit} className="relative">
           <Textarea
-            placeholder="Type your symptoms..."
-            className="min-h-24 pr-28"
+            placeholder="Describe your symptoms…"
+            className="min-h-24 pr-14"
             {...register("symptoms")}
           />
-          <div className="absolute right-3 top-3 flex items-center gap-2">
-            <Button type="button" variant="ghost" size="sm" aria-label="Voice">
-              <Mic size={16} />
-            </Button>
-            <Button type="submit" size="sm" aria-label="Send">
-              <Send size={16} />
-            </Button>
-          </div>
-
+          <Button
+            type="submit"
+            size="sm"
+            disabled={isPending}
+            aria-label="Send"
+            className="absolute right-3 top-3"
+          >
+            {isPending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+          </Button>
           {errors.symptoms && (
-            <p className="mt-2 text-xs text-danger">
-              {errors.symptoms.message}
-            </p>
+            <p className="mt-2 text-xs text-danger">{errors.symptoms.message}</p>
           )}
           {state.status === "error" && state.error && (
             <p className="mt-2 text-xs text-danger">{state.error}</p>
           )}
         </form>
-      </div>
-
-      {state.structured && (
-        <div className="rounded-3xl border border-border bg-card p-4">
-          <div className="flex items-center justify-between">
-            <p className="text-sm font-semibold">Structured intake</p>
-            <Badge variant="outline">JSON</Badge>
-          </div>
-          <pre className="mt-3 whitespace-pre-wrap text-xs text-muted-foreground">
-            {JSON.stringify(state.structured, null, 2)}
-          </pre>
-        </div>
-      )}
-
-      {(state.llmRequest || state.llmResponse) && (
-        <div className="rounded-3xl border border-border bg-card p-4">
-          <div className="flex items-center justify-between">
-            <p className="text-sm font-semibold">LLM Transcript</p>
-            <Badge variant="outline">Demo</Badge>
-          </div>
-
-          {state.llmRequest && (
-            <div className="mt-3">
-              <p className="text-xs font-medium text-muted-foreground">
-                Request
-              </p>
-              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-sm">
-                {state.llmRequest}
-              </pre>
-            </div>
-          )}
-
-          {state.llmResponse && (
-            <div className="mt-3">
-              <p className="text-xs font-medium text-muted-foreground">
-                Raw response
-              </p>
-              <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap text-sm">
-                {state.llmResponse}
-              </pre>
-            </div>
-          )}
-        </div>
       )}
     </div>
   );
@@ -568,15 +458,15 @@ export function IntakeChat() {
 function TypingIndicator() {
   return (
     <div className="flex items-center gap-2 text-muted-foreground">
-      {[0, 1, 2].map((index) => (
+      {[0, 1, 2].map((i) => (
         <motion.span
-          key={index}
+          key={i}
           className="h-2 w-2 rounded-full bg-muted-foreground/60"
           animate={{ opacity: [0.3, 1, 0.3] }}
-          transition={{ duration: 1.2, repeat: Infinity, delay: index * 0.2 }}
+          transition={{ duration: 1.2, repeat: Infinity, delay: i * 0.2 }}
         />
       ))}
-      <span className="text-xs font-semibold">AI is typing</span>
+      <span className="text-xs font-semibold">AI is thinking…</span>
     </div>
   );
 }
